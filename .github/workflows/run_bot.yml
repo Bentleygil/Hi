@@ -1,0 +1,28 @@
+name: Run Alpaca Trend Bot
+
+on:
+  schedule:
+    # Runs Monday–Friday at 9:35 AM ET (covers both EDT and EST)
+    - cron: '35 14,15 * * 1-5'
+  workflow_dispatch: # Allows manual test runs anytime
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install alpaca-py pandas numpy
+
+      - name: Run trading script
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python trend_bot.py
