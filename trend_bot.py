@@ -25,8 +25,8 @@ from alpaca.data.enums import DataFeed
 # ==========================================
 # CONFIGURATION (Reads from GitHub Secrets)
 # ==========================================
-API_KEY = os.environ["ALPACA_API_KEY"]
-SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+API_KEY = os.environ["ALPACA_API_KEY"].strip()
+SECRET_KEY = os.environ["ALPACA_SECRET_KEY"].strip()
 PAPER = True  # Paper trading enabled
 
 TICKERS = ["TSLA", "NVDA", "AAPL", "META", "QQQ"]
