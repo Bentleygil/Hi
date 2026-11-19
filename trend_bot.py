@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from datetime import datetime, timedelta
@@ -5,29 +6,19 @@ import numpy as np
 import pandas as pd
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    StopOrderRequest,
-    ReplaceOrderRequest,
-    GetOrdersRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderType,
-    QueryOrderStatus,
-)
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 # ==========================================
-# CONFIGURATION (Reads from GitHub Secrets)
+# CONFIGURATION (Optimized for $1,000 Account)
 # ==========================================
 API_KEY = os.environ["ALPACA_API_KEY"].strip()
 SECRET_KEY = os.environ["ALPACA_SECRET_KEY"].strip()
-PAPER = True  # Paper trading enabled
+PAPER = True  # Set False only when ready for live money
 
 TICKERS = ["TSLA", "NVDA", "AAPL", "META", "QQQ"]
 CASH_ETF = "SGOV"
@@ -35,10 +26,32 @@ ATR_MULTIPLIER = 3.5
 TOTAL_TARGET_WEIGHT = 0.98
 CASH_BUFFER = 0.02
 WEIGHT_PER_SYMBOL = TOTAL_TARGET_WEIGHT / len(TICKERS)
+MIN_NOTIONAL_ORDER = 5.00  # Alpaca minimum fractional order is $1; $5 avoids dust
+STOP_STATE_FILE = "stop_levels.json"
 
 # Initialize Alpaca Clients
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+
+# ==========================================
+# TRAILING STOP STATE STORAGE
+# ==========================================
+def load_stops() -> dict[str, float]:
+    """Loads saved trailing stop prices for fractional positions."""
+    if os.path.exists(STOP_STATE_FILE):
+        try:
+            with open(STOP_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_stops(stops: dict[str, float]) -> None:
+    """Saves updated trailing stop prices."""
+    with open(STOP_STATE_FILE, "w") as f:
+        json.dump(stops, f, indent=2)
 
 
 # ==========================================
@@ -67,7 +80,7 @@ def get_indicators(symbol: str) -> dict | None:
     # SMA 200
     df["sma_200"] = df["close"].rolling(window=200).mean()
 
-    # ATR 14 (Simple Moving Average of True Range to match QuantConnect)
+    # ATR 14
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close = (df["low"] - df["close"].shift()).abs()
@@ -84,80 +97,30 @@ def get_indicators(symbol: str) -> dict | None:
     }
 
 
-def get_latest_price(symbol: str) -> float:
-    """Gets the most recent daily close price for cash sizing."""
-    start_date = datetime.now() - timedelta(days=10)
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Day,
-        start=start_date,
-        feed=DataFeed.IEX,
-    )
-    bars = data_client.get_stock_bars(request).df
-    return float(bars["close"].iloc[-1])
-
-
-# ==========================================
-# ORDER & STOP MANAGEMENT
-# ==========================================
-def get_open_stop_order(symbol: str):
-    """Finds an active GTC stop order for a given symbol."""
-    req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-    orders = trading_client.get_orders(filter=req)
-    for order in orders:
-        if order.type == OrderType.STOP and order.side == OrderSide.SELL:
-            return order
-    return None
-
-
-def place_or_update_stop(symbol: str, qty: int, new_stop: float) -> None:
-    """Places a new GTC stop order or ratchets up an existing stop order."""
-    new_stop = round(new_stop, 2)
-    existing_stop = get_open_stop_order(symbol)
-
-    if existing_stop:
-        current_stop_price = float(existing_stop.stop_price)
-        current_qty = int(float(existing_stop.qty))
-
-        if new_stop > current_stop_price or qty != current_qty:
-            target_stop = max(new_stop, current_stop_price)
-            print(f"[{symbol}] Updating stop to ${target_stop} (Qty: {qty})")
-            replace_req = ReplaceOrderRequest(qty=qty, stop_price=target_stop)
-            trading_client.replace_order_by_id(existing_stop.id, replace_req)
-        return
-
-    print(f"[{symbol}] Placing new GTC stop at ${new_stop} (Qty: {qty})")
-    stop_req = StopOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.GTC,
-        stop_price=new_stop,
-    )
-    trading_client.submit_order(stop_req)
-
-
 # ==========================================
 # MAIN STRATEGY EXECUTION
 # ==========================================
 def run_strategy() -> None:
-    print(f"\n--- Running Strategy Check: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"\n--- Running Fractional Strategy Check: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     account = trading_client.get_account()
     portfolio_value = float(account.portfolio_value)
     available_cash = float(account.cash)
 
-    positions = {p.symbol: int(float(p.qty)) for p in trading_client.get_all_positions()}
+    # Map current open positions (fractional qty and market value)
+    positions = {
+        p.symbol: {
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+        }
+        for p in trading_client.get_all_positions()
+    }
 
-    sgov_orders = trading_client.get_orders(
-        GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[CASH_ETF])
-    )
-    for o in sgov_orders:
-        trading_client.cancel_order_by_id(o.id)
-
+    stops = load_stops()
     pending_entry_dollars = 0.0
-    new_entries = []
+    new_entries: list[tuple[str, float, float]] = []
 
+    # 1. Check existing positions for trailing stop exits/ratchets & collect new entries
     for symbol in TICKERS:
         ind = get_indicators(symbol)
         if not ind:
@@ -166,74 +129,96 @@ def run_strategy() -> None:
         close = ind["close"]
         trend_bullish = ind["ema_fast"] > ind["ema_slow"]
         above_regime = close > ind["sma_200"]
-        stop_price = close - (ATR_MULTIPLIER * ind["atr"])
+        candidate_stop = round(close - (ATR_MULTIPLIER * ind["atr"]), 2)
 
-        if symbol in positions and positions[symbol] > 0:
-            place_or_update_stop(symbol, positions[symbol], stop_price)
+        # Case A: Already holding fractional position
+        if symbol in positions and positions[symbol]["qty"] > 0:
+            current_stop = stops.get(symbol, candidate_stop)
+
+            # Exit if price fell below our ratcheted trailing stop
+            if close <= current_stop:
+                print(f"[{symbol}] Stop triggered (${close:.2f} <= ${current_stop:.2f}). Closing position...")
+                trading_client.close_position(symbol)
+                stops.pop(symbol, None)
+                time.sleep(2)
+            else:
+                # Ratchet stop upward only
+                new_stop = max(current_stop, candidate_stop)
+                stops[symbol] = new_stop
+                print(f"[{symbol}] Holding | Price: ${close:.2f} | Trailing Stop: ${new_stop:.2f}")
             continue
 
+        # Clean up stale stop if position was closed externally
+        stops.pop(symbol, None)
+
+        # Skip if an order is already pending
         open_orders = trading_client.get_orders(
             GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
         )
         if len(open_orders) > 0:
             continue
 
+        # Case B: New bullish trend entry using fractional dollar slice
         if trend_bullish and above_regime:
-            target_dollars = portfolio_value * WEIGHT_PER_SYMBOL
-            qty = int(target_dollars // close)
-            if qty > 0:
-                est_cost = qty * close
-                new_entries.append((symbol, qty, stop_price))
-                pending_entry_dollars += est_cost
+            target_dollars = round(portfolio_value * WEIGHT_PER_SYMBOL, 2)
+            if target_dollars >= MIN_NOTIONAL_ORDER:
+                new_entries.append((symbol, target_dollars, candidate_stop))
+                pending_entry_dollars += target_dollars
 
-    sgov_qty = positions.get(CASH_ETF, 0)
-    if pending_entry_dollars > available_cash and sgov_qty > 0:
-        sgov_price = get_latest_price(CASH_ETF)
-        shortfall = (pending_entry_dollars - available_cash) * 1.01
-        shares_to_sell = min(sgov_qty, int(shortfall // sgov_price) + 1)
+    # 2. Free up cash from fractional SGOV if needed for new entries
+    sgov_pos = positions.get(CASH_ETF)
+    if pending_entry_dollars > available_cash and sgov_pos and sgov_pos["market_value"] > MIN_NOTIONAL_ORDER:
+        shortfall = round((pending_entry_dollars - available_cash) * 1.02, 2)
+        dollars_to_sell = min(round(sgov_pos["market_value"], 2), shortfall)
 
-        if shares_to_sell > 0:
-            print(f"[{CASH_ETF}] Selling {shares_to_sell} shares to fund new entries...")
+        if dollars_to_sell >= MIN_NOTIONAL_ORDER:
+            print(f"[{CASH_ETF}] Selling ${dollars_to_sell:.2f} of SGOV to fund entries...")
             sell_sgov = MarketOrderRequest(
                 symbol=CASH_ETF,
-                qty=shares_to_sell,
+                notional=dollars_to_sell,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
             )
             trading_client.submit_order(sell_sgov)
             time.sleep(3)
 
-    for symbol, qty, initial_stop in new_entries:
-        print(f"[{symbol}] Submitting BUY order for {qty} shares...")
+    # 3. Submit fractional dollar BUY orders for new entries
+    for symbol, dollars, initial_stop in new_entries:
+        refreshed_cash = float(trading_client.get_account().cash)
+        order_dollars = min(dollars, round(refreshed_cash - (portfolio_value * CASH_BUFFER), 2))
+        if order_dollars < MIN_NOTIONAL_ORDER:
+            print(f"[{symbol}] Skipping entry—insufficient deployable cash (${order_dollars:.2f}).")
+            continue
+
+        print(f"[{symbol}] Submitting fractional BUY for ${order_dollars:.2f} (Initial Stop: ${initial_stop:.2f})...")
         buy_req = MarketOrderRequest(
             symbol=symbol,
-            qty=qty,
+            notional=order_dollars,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
         )
         trading_client.submit_order(buy_req)
+        stops[symbol] = initial_stop
         time.sleep(2)
-        place_or_update_stop(symbol, qty, initial_stop)
 
+    # 4. Sweep remaining idle cash into fractional SGOV
     time.sleep(2)
     refreshed_account = trading_client.get_account()
     current_cash = float(refreshed_account.cash)
     min_cash_reserve = portfolio_value * CASH_BUFFER
-    deployable_cash = current_cash - min_cash_reserve
+    deployable_cash = round(current_cash - min_cash_reserve, 2)
 
-    sgov_price = get_latest_price(CASH_ETF)
-    if deployable_cash >= sgov_price:
-        qty_to_buy = int(deployable_cash // sgov_price)
-        if qty_to_buy > 0:
-            print(f"[{CASH_ETF}] Sweeping idle cash into {qty_to_buy} shares...")
-            buy_sgov = MarketOrderRequest(
-                symbol=CASH_ETF,
-                qty=qty_to_buy,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
-            trading_client.submit_order(buy_sgov)
+    if deployable_cash >= MIN_NOTIONAL_ORDER:
+        print(f"[{CASH_ETF}] Sweeping ${deployable_cash:.2f} idle cash into SGOV...")
+        buy_sgov = MarketOrderRequest(
+            symbol=CASH_ETF,
+            notional=deployable_cash,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        )
+        trading_client.submit_order(buy_sgov)
 
+    save_stops(stops)
     print("--- Strategy Check Complete ---")
 
 
